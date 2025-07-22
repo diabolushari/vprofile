@@ -1,64 +1,84 @@
-pipeline {
+def COLOR_MAP = [
+    'SUCCESS': 'good', 
+    'FAILURE': 'danger',
+]
+pipeline{
     agent any
-    options {
-        // Adds timestamps to console logs
-        timestamps()
+    tools {
+        jdk 'JDK17'
+        maven 'MAVEN3.9'
     }
-
-    environment {
-        JAVA_HOME = '/usr/lib/jvm/java-17-openjdk'
-        GIT_CREDENTIALS_ID = '43d1fe7b-7f7f-4cc5-a16c-2c2c0aede42c'
-        TARGET_REPO = 'https://github.com/diabolushari/petclinic_artifacts.git'
-    }
-
     stages {
-        stage('Checkout') {
+        stage('Fetch Code') {
             steps {
-                git credentialsId: env.GIT_CREDENTIALS_ID, url: 'https://github.com/diabolushari/petclinic.git', branch: 'main'
+                git branch: 'main', url: 'https://github.com/diabolushari/vprofile.git'
             }
         }
-
-        stage('Run Unit Tests') {
+        stage('Build') {
             steps {
-                sh './gradlew clean test'
+                sh 'mvn install -DskipTests'
             }
         }
-
-        stage('Package with Timestamp') {
+        stage('Unit Test') {
             steps {
-                script {
-                    def ts = new Date().format("yyyyMMdd-HHmmss", TimeZone.getDefault())
-                    env.BUILD_TIMESTAMP = ts
-                    sh "./gradlew build -x test -Pversion=${ts}"
+                sh 'mvn test'
+            }
+        }
+        stage('checkstyle analysis') {
+            steps {
+                sh 'mvn checkstyle:checkstyle'
+            }
+        }
+        stage("SonarQube analysis") {
+            environment{
+                scannerHome = tool 'sonar6.2'
                 }
-            }
-        }
-
-        stage('Push Artifact to Git') {
             steps {
-                script {
-                    def ts = env.BUILD_TIMESTAMP
-                    def artifact = sh(script: "ls build/libs/*.jar | head -1", returnStdout: true).trim()
-                    sh """
-                        rm -rf artifact-repo
-                        git clone https://${GIT_CREDENTIALS_ID}@${TARGET_REPO.replace('https://','')} artifact-repo
-                        cp ${artifact} artifact-repo/petclinic-${ts}.jar
-                        cd artifact-repo
-                        git add .
-                        git commit -m "Artifact built at ${ts}"
-                        git push origin main
-                    """
-                }
+              withSonarQubeEnv('sonarserver') {
+                sh '''${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=vprofile \
+                    -Dsonar.projectName=vprofile \
+                    -Dsonar.projectVersion=1.0 \
+                    -Dsonar.sources=src/ \
+                    -Dsonar.java.binaries=target/test-classes/com/visualpathit/account/controllerTest/ \
+                    -Dsonar.junit.reportsPath=target/surefire-reports/ \
+                    -Dsonar.jacoco.reportsPath=target/jacoco.exec \
+                    -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml'''
+              }
             }
-        }
+          }
+          stage("Quality Gate") {
+            steps {
+              timeout(time: 1, unit: 'HOURS') {
+                waitForQualityGate abortPipeline: true
+              }
+            }
+          }
+          stage('Upload Artifact') {
+            steps {
+                    nexusArtifactUploader(
+                        nexusVersion: 'nexus3',
+                        protocol: 'http',
+                        nexusUrl: '172.31.93.135:8081',
+                        groupId: 'QA',
+                        version: "${env.BUILD_ID}-${env.BUILD_TIMESTAMP}",
+                        repository: 'vpro-repo',
+                        credentialsId: 'nexuslogin',
+                        artifacts: [
+                            [artifactId: 'vpro',
+                            classifier: '',
+                            file: 'target/vprofile-v2.war',
+                            type: 'war']
+                        ]
+                        )
+            }
+          }
     }
-
     post {
-        success {
-            echo "✅ Build & push completed with timestamp: ${env.BUILD_TIMESTAMP}"
-        }
-        failure {
-            echo "❌ Build failed – check console output!"
+        always {
+            echo 'Slack Notifications.'
+            slackSend channel: '#all-hkhkinfotechshop',
+                color: COLOR_MAP[currentBuild.currentResult],
+                message: "*${currentBuild.currentResult}:* Job ${env.JOB_NAME} build ${env.BUILD_NUMBER} \n More info at: ${env.BUILD_URL}"
         }
     }
 }
